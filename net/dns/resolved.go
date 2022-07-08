@@ -84,7 +84,7 @@ type resolvedManager struct {
 	logf  logger.Logf
 	ifidx int
 
-	configs chan (OSConfig) // configs is a channel of OSConfigs, one per each SetDNS call
+	configs chan OSConfig // configs is a channel of OSConfigs, one per each SetDNS call
 }
 
 func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManager, error) {
@@ -99,8 +99,9 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 		ctx:    ctx,
 		cancel: cancel,
 
-		logf:  logf,
-		ifidx: iface.Index,
+		logf:    logf,
+		ifidx:   iface.Index,
+		configs: make(chan OSConfig),
 	}
 
 	go mgr.run(ctx)
@@ -109,7 +110,7 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 }
 
 func (m *resolvedManager) SetDNS(config OSConfig) error {
-	// TODO(raggi): add some retry logic (probably in the syncLocked call)
+	// TODO(raggi|warrick): add error channel output from goroutine
 	m.configs <- config
 
 	return nil
@@ -131,6 +132,7 @@ func (m *resolvedManager) run(ctx context.Context) {
 	}()
 
 	reconnect := func() error {
+		signals = make(chan *dbus.Signal, 16)
 		var err error
 		conn, err = dbus.SystemBus()
 		if err != nil {
@@ -139,7 +141,6 @@ func (m *resolvedManager) run(ctx context.Context) {
 		}
 
 		r1Manager = conn.Object(dbusResolvedObject, dbus.ObjectPath(dbusResolvedPath))
-		signals = make(chan *dbus.Signal, 16)
 
 		// Only receive the DBus signals we need to resync our config on
 		// resolved restart. Failure to set filters isn't a fatal error,
@@ -151,8 +152,6 @@ func (m *resolvedManager) run(ctx context.Context) {
 		conn.Signal(signals)
 		return err
 	}
-
-	// TODO(raggi): do we want to retry on initial connect?
 	reconnect()
 
 	lastConfig := OSConfig{}
@@ -184,10 +183,10 @@ func (m *resolvedManager) run(ctx context.Context) {
 		case signal, ok := <-signals:
 			if !ok {
 				if err := reconnect(); err != nil {
-					continue
+					m.logf("Reconnect error %T", err)
 				}
+				continue
 			}
-
 			// In theory the signal was filtered by DBus, but if
 			// AddMatchSignal in the constructor failed, we may be
 			// getting other spam.
